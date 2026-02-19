@@ -21,6 +21,7 @@ class Args(NamedTuple):
     schedule_block: bool
     model_type: str
     enable_metrics: bool
+    disable_frontend_mount: bool
     target_latency: float
 
     def pretty_print(self):
@@ -65,8 +66,8 @@ parser.add_argument("--timeout", type=float, default=TIMEOUT, help="Timeout")
 # This is the default config for the pipeline, it can be overridden by the command line arguments
 parser.add_argument("--config_path", type=str, default="../configs/wan_causal_dmd_v2v.yaml")
 parser.add_argument("--checkpoint_folder", type=str, default="../ckpts/wan_causal_dmd_v2v")
-parser.add_argument("--step", type=int, default=2)
-parser.add_argument("--noise_scale", type=float, default=0.8)
+parser.add_argument("--step", type=int, default=4)
+parser.add_argument("--noise_scale", type=float, default=1.0)
 parser.add_argument("--debug", type=bool, default=True)
 parser.add_argument("--num_gpus", type=int, default=2)
 parser.add_argument("--gpu_ids", type=str, default="0,1") # id separated by comma, size should match num_gpus
@@ -79,5 +80,16 @@ parser.add_argument("--model_type", type=str, default="T2V-1.3B", help="Model ty
 # Metrics collection
 parser.add_argument("--enable-metrics", dest="enable_metrics", action="store_true", default=False, help="Enable SLO metrics collection")
 parser.add_argument("--target-latency", dest="target_latency", type=float, default=1.0, help="Target latency in seconds for deadline miss rate calculation (default: 0.5s)")
+parser.add_argument(
+    "--disable-frontend-mount",
+    action="store_true",
+    default=False,
+    help="Disable mounting static frontend assets from demo/",
+)
 
-config = Args(**vars(parser.parse_args()))
+_parsed_args = vars(parser.parse_args())
+_disable_frontend_mount_env = os.getenv("STREAMDIFFUSION_DISABLE_FRONTEND_MOUNT", "").lower()
+if _disable_frontend_mount_env in {"1", "true", "yes", "on"}:
+    _parsed_args["disable_frontend_mount"] = True
+
+config = Args(**_parsed_args)

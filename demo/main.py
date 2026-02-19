@@ -9,10 +9,10 @@ import markdown2
 import logging
 import uuid
 import time
+from typing import Dict
 from types import SimpleNamespace
 import asyncio
 import os
-import time
 import mimetypes
 import threading
 import multiprocessing as mp
@@ -29,10 +29,86 @@ mimetypes.add_type("application/javascript", ".js")
 
 THROTTLE = 1.0 / 120
 # logging.basicConfig(level=logging.DEBUG)
+_STARTUP_TS = time.perf_counter()
+_STARTUP_STATUS: Dict[str, object] = {
+    "stage": "booting",
+    "message": "Starting process.",
+    "percent": 0,
+    "elapsed": 0.0,
+    "last_updated": None,
+}
+_STARTUP_PHASE_PERCENT = {
+    "installing shutdown handlers": 5,
+    "configured multiprocessing start method": 10,
+    "printing effective config": 15,
+    "initializing text encoder": 35,
+    "initializing text encoder wrapper": 35,
+    "loading text encoder": 40,
+    "creating text encoder backbone module graph": 38,
+    "building text encoder backbone module graph": 52,
+    "preparing text encoder module graph": 38,
+    "preparing text encoder tokenizer": 58,
+    "text encoder backbone module graph ready": 56,
+    "building text encoder block": 58,
+    "building text encoder block progress": 66,
+    "building text encoder module graph": 56,
+    "building text decoder block": 60,
+    "text encoder checkpoint payload loaded": 60,
+    "text encoder checkpoint payload loaded in": 61,
+    "text encoder checkpoint file size": 60,
+    "text encoder checkpoint tensors": 62,
+    "text encoder state dict progress": 66,
+    "text encoder state dict applied": 70,
+    "text encoder state dict bytes": 70,
+    "state dict loaded": 68,
+    "state dict applied": 70,
+    "text encoder checkpoint": 60,
+    "preparing encoder module graph": 56,
+    "preparing decoder module graph": 56,
+    "initializing vae": 62,
+    "loading vae model": 66,
+    "initializing diffusion wrapper": 60,
+    "wan model loaded": 65,
+    "diffusion wrapper ready": 68,
+    "creating processing pipeline": 25,
+    "importing multipgupipeline module": 30,
+    "importing multigpu pipeline module": 30,
+    "instantiating multigpu pipeline": 45,
+    "importing single-gpu pipeline module": 30,
+    "instantiating single-gpu pipeline": 45,
+    "pipeline creation took": 58,
+    "app object instantiated": 75,
+    "starting uvicorn": 90,
+}
+
+def _coerce_startup_message(message: str) -> str:
+    lowered = message.lower()
+    for key in _STARTUP_PHASE_PERCENT:
+        if key in lowered:
+            return key
+    return lowered
+
+def _set_startup_status(message: str, percent: int | None = None) -> None:
+    elapsed = time.perf_counter() - _STARTUP_TS
+    key = _coerce_startup_message(message)
+    _STARTUP_STATUS["message"] = message
+    _STARTUP_STATUS["elapsed"] = round(elapsed, 2)
+    _STARTUP_STATUS["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _STARTUP_STATUS["stage"] = key
+    if percent is None:
+        percent = _STARTUP_PHASE_PERCENT.get(key, _STARTUP_STATUS.get("percent", 0))
+    _STARTUP_STATUS["percent"] = int(percent)
+
+
+def log_startup_step(message: str, percent: int | None = None) -> None:
+    elapsed = time.perf_counter() - _STARTUP_TS
+    print(f"[Main][startup {elapsed:0.2f}s] {message}")
+    _set_startup_status(message, percent)
 
 
 class App:
     def __init__(self, config: Args, pipeline):
+        log_startup_step("Initializing StreamDiffusion app")
         self.args = config
         self.pipeline = pipeline
         self.app = FastAPI()
@@ -56,6 +132,7 @@ class App:
             self.metrics_log_dir = "./slo_metrics"
             os.makedirs(self.metrics_log_dir, exist_ok=True)
         self.init_app()
+        log_startup_step("App routes and middleware ready")
 
     def init_app(self):
         self.app.add_middleware(
@@ -196,6 +273,10 @@ class App:
         async def get_queue_size():
             queue_size = self.conn_manager.get_user_count()
             return JSONResponse({"queue_size": queue_size})
+
+        @self.app.get("/api/startup-progress")
+        async def get_startup_progress():
+            return JSONResponse(dict(_STARTUP_STATUS))
         
         @self.app.get("/api/metrics/{user_id}")
         async def get_metrics(user_id: uuid.UUID, window_size: int = 100):
@@ -461,18 +542,26 @@ class App:
                 }
             )
 
-        if not os.path.exists("./frontend/public"):
-            os.makedirs("./frontend/public")
+        should_mount_frontend = not getattr(config, "disable_frontend_mount", False)
+        if should_mount_frontend:
+            print("[Main] Frontend mount enabled.")
+            if not os.path.exists("./frontend/public"):
+                os.makedirs("./frontend/public")
 
-        self.app.mount(
-            "/", StaticFiles(directory="./frontend/public", html=True), name="public"
-        )
+            self.app.mount(
+                "/", StaticFiles(directory="./frontend/public", html=True), name="public"
+            )
 
         # Add shutdown event handler
-        @self.app.on_event("shutdown")
+        async def on_startup() -> None:
+            log_startup_step("Backend startup complete; server ready", percent=100)
+
         async def shutdown_event():
             print("[App] Shutdown event triggered, cleaning up...")
             await self.cleanup()
+
+        self.app.add_event_handler("startup", on_startup)
+        self.app.add_event_handler("shutdown", shutdown_event)
 
     def _log_metrics_to_file(self, user_id: uuid.UUID):
         """Log metrics to file after collecting 1000 batches"""
@@ -645,25 +734,38 @@ def signal_handler(signum, frame):
 if __name__ == "__main__":
     import uvicorn
 
+    log_startup_step("Installing shutdown handlers")
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    log_startup_step("Configured multiprocessing start method")
     mp.set_start_method("spawn", force=True)
 
+    log_startup_step("Printing effective config")
     config.pretty_print()
+
+    log_startup_step("Creating processing pipeline")
+    pipeline_start = time.perf_counter()
     if config.num_gpus > 1:
+        log_startup_step("Importing MultiGPUPipeline module")
         from vid2vid_pipe import MultiGPUPipeline
+        log_startup_step("Instantiating MultiGPU pipeline")
         pipeline = MultiGPUPipeline(config)
     else:
+        log_startup_step("Importing single-GPU Pipeline module")
         from vid2vid import Pipeline
+        log_startup_step("Instantiating single-GPU pipeline")
         pipeline = Pipeline(config)
+    log_startup_step(f"Pipeline creation took {time.perf_counter() - pipeline_start:.2f}s")
 
     app_obj = App(config, pipeline)
+    log_startup_step("App object instantiated")
     app = app_obj.app
     app_instance = app_obj  # Set global reference for signal handler
 
     try:
+        log_startup_step(f"Starting uvicorn on {config.host}:{config.port}")
         uvicorn.run(
             app,
             host=config.host,

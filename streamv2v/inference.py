@@ -87,6 +87,8 @@ class SingleGPUInferencePipeline:
             device: GPU device
         """
         self.config = config
+        self._startup_ts = time.perf_counter()
+        self._log_startup_step("Initializing SingleGPUInferencePipeline")
         self.device = device
         
         # Setup logging
@@ -97,13 +99,20 @@ class SingleGPUInferencePipeline:
         
         if not self.logger.handlers:
             handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            formatter = logging.Formatter("%(name)s - %(levelname)s - %(message)s")
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
         
         # Initialize pipeline
+        self._log_startup_step(f"Creating CausalStreamInferencePipeline on {device}")
         self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
+        self._log_startup_step("CausalStreamInferencePipeline instantiated")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         self.pipeline.to(device=str(device), dtype=torch.bfloat16)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._log_startup_step("CausalStreamInferencePipeline moved to bfloat16")
         
         # Performance tracking
         self.t_dit = 100.0
@@ -114,15 +123,28 @@ class SingleGPUInferencePipeline:
         self.t_refresh = 50
 
         
+        self._log_startup_step("SingleGPUInferencePipeline initialization complete")
         self.logger.info("Single GPU inference pipeline manager initialized")
     
     def load_model(self, checkpoint_folder: str):
         """Load the model from checkpoint."""
+        self._log_startup_step(f"Loading checkpoint from {checkpoint_folder}")
         ckpt_path = os.path.join(checkpoint_folder, "model.pt")
         self.logger.info(f"Loading checkpoint from {ckpt_path}")
+        self._log_startup_step("Reading checkpoint from disk")
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        self._log_startup_step("Checkpoint tensor map loaded")
+        self._log_startup_step("Inspecting checkpoint payload")
+
+        if isinstance(ckpt, dict):
+            self._log_startup_step(
+                f"Checkpoint contains keys: {', '.join(sorted(list(ckpt.keys())))[:180]}"
+            )
+        else:
+            self._log_startup_step("Checkpoint payload is raw state dict (no container metadata).")
 
         # Decide which key holds the generator state dict
+        self._log_startup_step("Locating generator weights entry")
         if isinstance(ckpt, dict):
             if 'generator' in ckpt:
                 state_dict = ckpt['generator']
@@ -139,10 +161,15 @@ class SingleGPUInferencePipeline:
         # Load into the pipeline generator
         try:
             self.pipeline.generator.load_state_dict(state_dict, strict=True)
+            self._log_startup_step("Model weights loaded with strict state_dict")
         except RuntimeError as e:
             # Try non-strict load as a fallback and report
             self.logger.warning(f"Strict load_state_dict failed: {e}; retrying with strict=False")
             self.pipeline.generator.load_state_dict(state_dict, strict=False)
+            self._log_startup_step("Model weights loaded with strict=False fallback")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._log_startup_step("Checkpoint load complete")
     
     def prepare_pipeline(self, text_prompts: list, noise: torch.Tensor, 
                         current_start: int, current_end: int):
@@ -158,6 +185,10 @@ class SingleGPUInferencePipeline:
             current_end=current_end
         )
         return denoised_pred
+
+    def _log_startup_step(self, message: str) -> None:
+        elapsed = time.perf_counter() - self._startup_ts
+        print(f"[SingleGPUInference][startup {elapsed:0.2f}s] {message}")
     
     def run_inference(
         self, 

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenizers import HuggingfaceTokenizer
+from typing import Callable
 
 __all__ = [
     'T5Model',
@@ -15,6 +16,11 @@ __all__ = [
     'T5Decoder',
     'T5EncoderModel',
 ]
+
+
+def _emit_startup_log(startup_log_fn: Callable[[str], None] | None, message: str) -> None:
+    if startup_log_fn is not None:
+        startup_log_fn(message)
 
 
 def fp16_clamp(x):
@@ -275,8 +281,10 @@ class T5Encoder(nn.Module):
                  num_layers,
                  num_buckets,
                  shared_pos=True,
-                 dropout=0.1):
+                 dropout=0.1,
+                 startup_log_fn: Callable[[str], None] | None = None):
         super(T5Encoder, self).__init__()
+        _emit_startup_log(startup_log_fn, "Preparing text encoder module graph")
         self.dim = dim
         self.dim_attn = dim_attn
         self.dim_ffn = dim_ffn
@@ -284,17 +292,40 @@ class T5Encoder(nn.Module):
         self.num_layers = num_layers
         self.num_buckets = num_buckets
         self.shared_pos = shared_pos
+        _emit_startup_log(
+            startup_log_fn,
+            f"Text encoder module dimensions: dim={dim}, layers={num_layers}, heads={num_heads}"
+        )
 
         # layers
+        _emit_startup_log(startup_log_fn, "Creating text encoder embedding and positional layers")
+        _emit_startup_log(
+            startup_log_fn,
+            f"Creating token embedding table for vocab={getattr(vocab, 'num_embeddings', vocab)}"
+        )
         self.token_embedding = vocab if isinstance(vocab, nn.Embedding) \
             else nn.Embedding(vocab, dim)
         self.pos_embedding = T5RelativeEmbedding(
             num_buckets, num_heads, bidirectional=True) if shared_pos else None
         self.dropout = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            T5SelfAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets,
-                            shared_pos, dropout) for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList([])
+        for layer_index in range(num_layers):
+            _emit_startup_log(
+                startup_log_fn,
+                f"Building text encoder block {layer_index + 1}/{num_layers}"
+            )
+            self.blocks.append(
+                T5SelfAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets,
+                                shared_pos, dropout)
+            )
+            _emit_startup_log(
+                startup_log_fn,
+                f"Text encoder block {layer_index + 1}/{num_layers} built"
+            )
+        _emit_startup_log(
+            startup_log_fn,
+            f"Text encoder module graph assembled with {num_layers} attention blocks"
+        )
         self.norm = T5LayerNorm(dim)
 
         # initialize weights
@@ -323,8 +354,10 @@ class T5Decoder(nn.Module):
                  num_layers,
                  num_buckets,
                  shared_pos=True,
-                 dropout=0.1):
+                 dropout=0.1,
+                 startup_log_fn: Callable[[str], None] | None = None):
         super(T5Decoder, self).__init__()
+        _emit_startup_log(startup_log_fn, "Preparing text decoder module graph")
         self.dim = dim
         self.dim_attn = dim_attn
         self.dim_ffn = dim_ffn
@@ -332,17 +365,40 @@ class T5Decoder(nn.Module):
         self.num_layers = num_layers
         self.num_buckets = num_buckets
         self.shared_pos = shared_pos
+        _emit_startup_log(
+            startup_log_fn,
+            f"Text decoder module dimensions: dim={dim}, layers={num_layers}, heads={num_heads}"
+        )
 
         # layers
+        _emit_startup_log(startup_log_fn, "Creating text decoder embedding and positional layers")
+        _emit_startup_log(
+            startup_log_fn,
+            f"Creating token embedding table for vocab={getattr(vocab, 'num_embeddings', vocab)}"
+        )
         self.token_embedding = vocab if isinstance(vocab, nn.Embedding) \
             else nn.Embedding(vocab, dim)
         self.pos_embedding = T5RelativeEmbedding(
             num_buckets, num_heads, bidirectional=False) if shared_pos else None
         self.dropout = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([
-            T5CrossAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets,
-                             shared_pos, dropout) for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList([])
+        for layer_index in range(num_layers):
+            _emit_startup_log(
+                startup_log_fn,
+                f"Building text decoder block {layer_index + 1}/{num_layers}"
+            )
+            self.blocks.append(
+                T5CrossAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets,
+                                 shared_pos, dropout)
+            )
+            _emit_startup_log(
+                startup_log_fn,
+                f"Text decoder block {layer_index + 1}/{num_layers} built"
+            )
+        _emit_startup_log(
+            startup_log_fn,
+            f"Text decoder module graph assembled with {num_layers} attention blocks"
+        )
         self.norm = T5LayerNorm(dim)
 
         # initialize weights
@@ -381,8 +437,10 @@ class T5Model(nn.Module):
                  decoder_layers,
                  num_buckets,
                  shared_pos=True,
-                 dropout=0.1):
+                 dropout=0.1,
+                 startup_log_fn: Callable[[str], None] | None = None):
         super(T5Model, self).__init__()
+        _emit_startup_log(startup_log_fn, "Building full T5 module graph")
         self.vocab_size = vocab_size
         self.dim = dim
         self.dim_attn = dim_attn
@@ -391,15 +449,21 @@ class T5Model(nn.Module):
         self.encoder_layers = encoder_layers
         self.decoder_layers = decoder_layers
         self.num_buckets = num_buckets
+        _emit_startup_log(
+            startup_log_fn,
+            f"Building full T5 model graph (dim={dim}, encoder_layers={encoder_layers}, decoder_layers={decoder_layers})"
+        )
 
         # layers
         self.token_embedding = nn.Embedding(vocab_size, dim)
         self.encoder = T5Encoder(self.token_embedding, dim, dim_attn, dim_ffn,
                                  num_heads, encoder_layers, num_buckets,
-                                 shared_pos, dropout)
+                                 shared_pos, dropout,
+                                 startup_log_fn=startup_log_fn)
         self.decoder = T5Decoder(self.token_embedding, dim, dim_attn, dim_ffn,
                                  num_heads, decoder_layers, num_buckets,
-                                 shared_pos, dropout)
+                                 shared_pos, dropout,
+                                 startup_log_fn=startup_log_fn)
         self.head = nn.Linear(dim, vocab_size, bias=False)
 
         # initialize weights
@@ -419,6 +483,7 @@ def _t5(name,
         tokenizer_kwargs={},
         dtype=torch.float32,
         device='cpu',
+        startup_log_fn: Callable[[str], None] | None = None,
         **kwargs):
     # sanity check
     assert not (encoder_only and decoder_only)
@@ -429,13 +494,16 @@ def _t5(name,
         kwargs['vocab'] = kwargs.pop('vocab_size')
         kwargs['num_layers'] = kwargs.pop('encoder_layers')
         _ = kwargs.pop('decoder_layers')
+        kwargs['startup_log_fn'] = startup_log_fn
     elif decoder_only:
         model_cls = T5Decoder
         kwargs['vocab'] = kwargs.pop('vocab_size')
         kwargs['num_layers'] = kwargs.pop('decoder_layers')
         _ = kwargs.pop('encoder_layers')
+        kwargs['startup_log_fn'] = startup_log_fn
     else:
         model_cls = T5Model
+        kwargs['startup_log_fn'] = startup_log_fn
 
     # init model
     with torch.device(device):

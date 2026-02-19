@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 from omegaconf import OmegaConf
 from multiprocessing import Queue, Manager, Event, Process
 from util import read_images_from_queue, image_to_array, array_to_image, clear_queue
@@ -62,14 +63,20 @@ class Pipeline:
         )
 
     def __init__(self, args):
+        self._startup_ts = time.perf_counter()
+        self._log_startup_step("Starting pipeline constructor")
         torch.set_grad_enabled(False)
 
         params = self.InputParams()
+        self._log_startup_step("Loading pipeline config")
         config = OmegaConf.load(args.config_path)
         for k, v in args._asdict().items():
             config[k] = v
         config["height"] = params.height
         config["width"] = params.width
+        self._log_startup_step(
+            f"Configured canvas size: {config.width}x{config.height}"
+        )
 
         full_denoising_list = [700, 600, 500, 400, 0]
         step_value = config.step
@@ -81,12 +88,16 @@ class Pipeline:
             config.denoising_step_list = [700, 600, 400, 0]
         else:
             config.denoising_step_list = full_denoising_list
+        self._log_startup_step(
+            f"Configured denoising steps: {config.denoising_step_list}"
+        )
 
         self.prompt = params.prompt
         self.args = config
         self.prepare()
 
     def prepare(self):
+        self._log_startup_step("Creating multiprocessing queues + events")
         self.input_queue = Queue()
         self.output_queue = Queue()
         self.prepare_event = Event()
@@ -94,6 +105,7 @@ class Pipeline:
         self.restart_event = Event()
         self.prompt_dict = Manager().dict()
         self.prompt_dict["prompt"] = self.prompt
+        self._log_startup_step("Spawning single-GPU pipeline worker process")
         self.process = Process(
             target=generate_process,
             args=(self.args, self.prompt_dict, self.prepare_event, self.restart_event, self.stop_event, self.input_queue, self.output_queue),
@@ -101,7 +113,9 @@ class Pipeline:
         )
         self.process.start()
         self.processes = [self.process]
+        self._log_startup_step("Waiting for worker readiness event")
         self.prepare_event.wait()
+        self._log_startup_step("Worker signaled readiness")
 
     def accept_new_params(self, params: "Pipeline.InputParams"):
         if hasattr(params, "image"):
@@ -139,21 +153,37 @@ class Pipeline:
                     process.kill()
         print("Pipeline closed successfully")
 
+    def _log_startup_step(self, message: str) -> None:
+        elapsed = time.perf_counter() - self._startup_ts
+        print(f"[Pipeline][startup {elapsed:0.2f}s] {message}")
+
 
 def generate_process(args, prompt_dict, prepare_event, restart_event, stop_event, input_queue, output_queue):
+    process_start = time.perf_counter()
+
+    def log_startup_step(message: str) -> None:
+        elapsed = time.perf_counter() - process_start
+        print(f"[PipelineWorker][startup {elapsed:0.2f}s] {message}")
+
+    log_startup_step("Initializing worker process")
     torch.set_grad_enabled(False)
     device = torch.device(f"cuda:{args.gpu_ids.split(',')[0]}")
+    log_startup_step(f"Using inference device {device}")
 
+    log_startup_step("Instantiating SingleGPUInferencePipeline")
     pipeline_manager = SingleGPUInferencePipeline(args, device)
+    log_startup_step("Loading pipeline checkpoint")
     pipeline_manager.load_model(args.checkpoint_folder)
     num_steps = len(pipeline_manager.pipeline.denoising_step_list)
     base_chunk_size = pipeline_manager.base_chunk_size
     chunk_size = base_chunk_size * args.num_frame_per_block
     first_batch_num_frames = 1 + chunk_size
+    log_startup_step(f"Pipeline ready: denoising_steps={num_steps}, base_chunk_size={base_chunk_size}, chunk_size={chunk_size}")
     is_running = False
     input_batch = 0
     prompt = prompt_dict["prompt"]
 
+    log_startup_step("Worker initialized; signaling main process")
     prepare_event.set()
 
     while not stop_event.is_set():

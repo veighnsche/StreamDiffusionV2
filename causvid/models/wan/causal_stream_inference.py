@@ -6,24 +6,40 @@ from causvid.models import (
 from typing import List
 import torch
 import torch.distributed as dist
+import time
 
 class CausalStreamInferencePipeline(torch.nn.Module):
     def __init__(self, args, device):
         super().__init__()
+        self._startup_ts = time.perf_counter()
+
+        self._log_startup_step("Initializing causal stream inference pipeline")
         model_type = args.model_type
         self.device = device
+
+        generator_model = getattr(args, "generator_name", args.model_name)
+
+        self._log_startup_step(
+            f"Creating diffusion generator wrapper: model='{generator_model}', type='{model_type}'"
+        )
         # Step 1: Initialize all models
-        self.generator_model_name = getattr(
-            args, "generator_name", args.model_name)
-        self.generator = get_diffusion_wrapper(
-            model_name=self.generator_model_name)(model_type=model_type)
+        self.generator_model_name = generator_model
+        self.generator = get_diffusion_wrapper(model_name=self.generator_model_name)(model_type=model_type)
+
+        self._log_startup_step("Creating text encoder wrapper")
         self.text_encoder = get_text_encoder_wrapper(
             model_name=args.model_name)(model_type=model_type)
+
+        self._log_startup_step("Creating VAE wrapper")
         self.vae = get_vae_wrapper(model_name=args.model_name)(model_type=model_type)
 
+        self._log_startup_step("Configuring cache geometry")
+        self._log_startup_step("Initializing diffusion step schedule")
         # Step 2: Initialize all causal hyperparmeters
         self._init_denoising_step_list(args, device)
+        self._log_startup_step("Diffusion schedule ready")
 
+        self._log_startup_step("Computing model geometry")
         if model_type == "T2V-1.3B":
             self.num_transformer_blocks = 30
             self.num_heads = 12
@@ -50,21 +66,36 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(
             args, "num_frame_per_block", 1)
 
-        print(f"KV inference with {self.num_frame_per_block} frames per block")
+        self._log_startup_step(f"KV inference with {self.num_frame_per_block} frames per block")
+        self._log_startup_step("Preparing KV cache geometry")
 
         if self.num_frame_per_block > 1:
+            self._log_startup_step(
+                f"Overriding generator frame-per-block to {self.num_frame_per_block}"
+            )
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+        self._log_startup_step(f"Preparing diffusion model move to {self.device}")
+        self._log_startup_step(f"Moving diffusion model to {self.device}")
         self.generator.model.to(self.device)
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._log_startup_step("Causal stream pipeline initialized")
+
     def _init_denoising_step_list(self, args, device):
+        self._log_startup_step("Loading denoising step list")
         self.denoising_step_list = torch.tensor(
             args.denoising_step_list, dtype=torch.long, device=device)
         assert self.denoising_step_list[-1] == 0
         # remove the last timestep (which equals zero)
         self.denoising_step_list = self.denoising_step_list[:-1]
+        self._log_startup_step(
+            f"Denoising steps configured: {len(self.denoising_step_list)}"
+        )
 
         self.scheduler = self.generator.get_scheduler()
+        self._log_startup_step("Denoising scheduler ready")
         if args.warp_denoising_step:  # Warp the denoising step according to the scheduler time shift
             timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))).cuda()
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
@@ -73,6 +104,13 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         """
         Initialize a Per-GPU KV cache for the Wan model.
         """
+        self._log_startup_step(
+            f"Allocating KV cache for {batch_size} sample(s), "
+            f"heads={self.num_heads}, seq_len={self.kv_cache_length}, dtype={dtype}"
+        )
+        self._log_startup_step(
+            f"Initializing KV cache for {self.num_transformer_blocks} transformer blocks"
+        )
         kv_cache1 = []
         
         for i in range(self.num_transformer_blocks):
@@ -86,23 +124,47 @@ class CausalStreamInferencePipeline(torch.nn.Module):
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
             })
+            if i == 0 or (i + 1) in (
+                self.num_transformer_blocks // 3,
+                2 * self.num_transformer_blocks // 3,
+                self.num_transformer_blocks,
+            ):
+                self._log_startup_step(f"KV cache progress: {i + 1}/{self.num_transformer_blocks} blocks")
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
+        self._log_startup_step("KV cache initialized")
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """
         Initialize a Per-GPU cross-attention cache for the Wan model.
         """
+        self._log_startup_step(
+            f"Allocating cross-attention cache for {batch_size} sample(s), heads={self.num_heads}"
+        )
+        self._log_startup_step("Initializing cross-attention cache")
         crossattn_cache = []
 
-        for _ in range(self.num_transformer_blocks):
+        for i in range(self.num_transformer_blocks):
             crossattn_cache.append({
                 "k": torch.zeros([batch_size, 512, self.num_heads, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, 512, self.num_heads, 128], dtype=dtype, device=device),
                 "is_init": False,
             })
+            if i == 0 or (i + 1) in (
+                self.num_transformer_blocks // 3,
+                2 * self.num_transformer_blocks // 3,
+                self.num_transformer_blocks,
+            ):
+                self._log_startup_step(
+                    f"Cross-attention cache progress: {i + 1}/{self.num_transformer_blocks} blocks"
+                )
 
         self.crossattn_cache = crossattn_cache  # always store the clean cache
+        self._log_startup_step("Cross-attention cache initialized")
+
+    def _log_startup_step(self, message: str) -> None:
+        elapsed = time.perf_counter() - self._startup_ts
+        print(f"[SingleGPUInference][startup {elapsed:0.2f}s] {message}")
     
     def prepare(
         self,
@@ -119,18 +181,22 @@ class CausalStreamInferencePipeline(torch.nn.Module):
         self.device = device
         batch_size = noise.shape[0]
 
+        self._log_startup_step("Preparing prompt context")
         self.conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+        self._log_startup_step("Prompt context prepared")
 
         # Step 1: Initialize KV cache
         if self.kv_cache1 is None:
+            self._log_startup_step("KV cache missing; building for first frame")
             self._initialize_kv_cache(
                 batch_size=batch_size,
                 dtype=dtype,
                 device=device
             )
 
+            self._log_startup_step("Cross-attention cache missing; building for first frame")
             self._initialize_crossattn_cache(
                 batch_size=batch_size,
                 dtype=dtype,

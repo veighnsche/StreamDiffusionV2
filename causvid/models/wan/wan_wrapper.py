@@ -9,32 +9,138 @@ from causvid.models.wan.wan_base.modules.vae import _video_vae
 from causvid.models.wan.wan_base.modules.t5 import umt5_xxl
 from causvid.models.wan.flow_match import FlowMatchScheduler
 from causvid.models.wan.causal_model import CausalWanModel
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict, Optional
 import torch
 import os
 import torch.distributed as dist
 import time
 
+_STARTUP_TS = time.perf_counter()
+
+
+def _log_startup(message: str) -> None:
+    elapsed = time.perf_counter() - _STARTUP_TS
+    print(f"[SingleGPUInference][startup {elapsed:0.2f}s] {message}")
+
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _human_bytes(byte_count: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(byte_count)
+    idx = 0
+    while value >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    return f"{value:.2f} {units[idx]}"
+
+
+def _normalize_checkpoint_payload(payload: object) -> Dict[str, object]:
+    if not isinstance(payload, dict):
+        raise TypeError("Checkpoint file payload is not a dict; expected state_dict payload.")
+
+    if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+        return payload["state_dict"]
+
+    return payload
+
+
+def _log_weight_load_step(label: str, checkpoint_path: str, target: torch.nn.Module) -> None:
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+
+    file_size = os.path.getsize(checkpoint_path)
+    _log_startup(f"Inspecting {label} checkpoint file")
+    _log_startup(f"{label} checkpoint file size: {_human_bytes(file_size)} ({checkpoint_path})")
+
+    _log_startup(f"Reading {label} checkpoint payload into memory")
+    payload_start = time.perf_counter()
+    payload = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    payload_elapsed = time.perf_counter() - payload_start
+    _log_startup(
+        f"{label} checkpoint payload loaded in {payload_elapsed:0.2f}s"
+    )
+
+    state_dict = _normalize_checkpoint_payload(payload)
+    _log_startup(f"{label} checkpoint tensors: {len(state_dict)} entries")
+
+    _log_startup(f"Applying {label} state dict")
+    apply_start = time.perf_counter()
+    target_state = target.state_dict()
+    total_tensors = len(state_dict)
+    applied_tensors = 0
+    missing_tensors = 0
+    unexpected_tensors = 0
+    tensor_bytes = 0
+    report_every = max(1, total_tensors // 12)
+
+    for idx, (name, tensor) in enumerate(state_dict.items(), 1):
+        if not isinstance(tensor, torch.Tensor):
+            unexpected_tensors += 1
+            continue
+
+        destination = target_state.get(name)
+        if destination is None:
+            unexpected_tensors += 1
+            if unexpected_tensors <= 4:
+                _log_startup(f"{label} checkpoint contains unexpected key: {name}")
+            continue
+
+        if destination.shape != tensor.shape:
+            _log_startup(
+                f"{label} tensor shape mismatch for {name}: "
+                f"checkpoint={tuple(tensor.shape)} model={tuple(destination.shape)}"
+            )
+            raise RuntimeError(f"{label} checkpoint tensor shape mismatch for {name}")
+
+        if idx == 1:
+            _log_startup(
+                f"{label} loading tensor '{name}' ({tuple(tensor.shape)} -> {tuple(destination.shape)})"
+            )
+        destination.data.copy_(
+            tensor.to(dtype=destination.dtype, device=destination.device, non_blocking=True)
+        )
+        applied_tensors += 1
+        tensor_bytes += tensor.element_size() * tensor.numel()
+
+        if idx % report_every == 0 or idx == total_tensors:
+            percent = int((idx / total_tensors) * 100)
+            elapsed = time.perf_counter() - apply_start
+            bytes_per_second = tensor_bytes / elapsed if elapsed > 0 else 0.0
+            _log_startup(
+                f"{label} state dict progress: {idx}/{total_tensors} tensors applied "
+                f"({applied_tensors} copied, {percent}%, { _human_bytes(bytes_per_second) }/s)"
+            )
+
+    missing_tensors = len(target_state) - applied_tensors
+    apply_elapsed = time.perf_counter() - apply_start
+    _log_startup(f"{label} state dict bytes: {_human_bytes(tensor_bytes)}")
+    _log_startup(
+        f"{label} state dict applied in {apply_elapsed:0.2f}s "
+        f"(applied={applied_tensors}, missing={missing_tensors}, unexpected={unexpected_tensors})"
+    )
 
 
 class WanTextEncoder(TextEncoderInterface):
     def __init__(self, model_type="T2V-1.3B") -> None:
         super().__init__()
+        _log_startup(f"Initializing text encoder for {model_type}")
 
+        _log_startup("Building text encoder backbone module graph")
         self.text_encoder = umt5_xxl(
             encoder_only=True,
             return_tokenizer=False,
             dtype=torch.float32,
-            device=torch.device('cpu')
+            device=torch.device("cpu"),
+            startup_log_fn=_log_startup,
         ).eval().requires_grad_(False)
-        self.text_encoder.load_state_dict(
-            torch.load(
-                os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/models_t5_umt5-xxl-enc-bf16.pth"),
-                map_location='cpu', weights_only=False
-            )
+        _log_startup("Text encoder backbone module graph ready")
+        _log_weight_load_step(
+            "text encoder",
+            os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/models_t5_umt5-xxl-enc-bf16.pth"),
+            self.text_encoder
         )
-
+        _log_startup("Preparing text encoder tokenizer")
         self.tokenizer = HuggingfaceTokenizer(
             name=os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/google/umt5-xxl/"), seq_len=512, clean='whitespace')
 
@@ -61,6 +167,7 @@ class WanTextEncoder(TextEncoderInterface):
 class WanVAEWrapper(VAEInterface):
     def __init__(self, model_type="T2V-1.3B"):
         super().__init__()
+        _log_startup(f"Initializing VAE for {model_type}")
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -72,11 +179,13 @@ class WanVAEWrapper(VAEInterface):
         self.mean = torch.tensor(mean, dtype=torch.float32)
         self.std = torch.tensor(std, dtype=torch.float32)
 
-        # init model
+        _log_startup("Loading VAE model")
+        _log_startup("Building VAE module graph")
         self.model = _video_vae(
             pretrained_path=os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/Wan2.1_VAE.pth"),
             z_dim=16,
         ).eval().requires_grad_(False)
+        _log_startup("VAE model initialized")
 
     def decode_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
         # from [batch_size, num_frames, num_channels, height, width]
@@ -136,16 +245,23 @@ class WanVAEWrapper(VAEInterface):
 class WanDiffusionWrapper(DiffusionModelInterface):
     def __init__(self, model_type="T2V-1.3B"):
         super().__init__()
+        _log_startup(f"Initializing diffusion wrapper for {model_type}")
 
+        _log_startup("Loading Wan diffusion architecture")
         self.model = WanModel.from_pretrained(os.path.join(repo_root, f"wan_models/Wan2.1-{model_type}/"))
+        _log_startup("Wan model loaded")
         self.model.eval()
 
+        _log_startup("Initializing diffusion scheduler")
         self.uniform_timestep = True
 
         self.scheduler = FlowMatchScheduler(
             shift=8.0, sigma_min=0.0, extra_one_step=True
         )
+        _log_startup("Diffusion scheduler initialized")
+        _log_startup("Configuring diffusion timesteps")
         self.scheduler.set_timesteps(1000, training=True)
+        _log_startup("Diffusion wrapper ready")
 
         self.seq_len = 32760  # [1, 21, 16, 60, 104]
         super().post_init()

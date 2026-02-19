@@ -20,7 +20,17 @@ from streamv2v.inference import compute_noise_scale_and_step
 
 
 class MultiGPUPipeline(Pipeline):
+    def __init__(self, args):
+        self._startup_ts = time.perf_counter()
+        self._log_startup_step("Starting multi-GPU pipeline constructor")
+        super().__init__(args)
+
+    def _log_startup_step(self, message: str) -> None:
+        elapsed = time.perf_counter() - self._startup_ts
+        print(f"[Pipeline][startup {elapsed:0.2f}s] {message}")
+
     def prepare(self):
+        self._log_startup_step("Preparing multi-GPU block layout")
         total_blocks = 30
         if self.args.num_gpus == 2:
             self.total_block_num = [[0, 15], [15, total_blocks]]
@@ -61,9 +71,12 @@ class MultiGPUPipeline(Pipeline):
             daemon=True
         )
         self.processes = [self.p_input] + self.p_middles + [self.p_output]
+        self._log_startup_step(f"Spawned {len(self.processes)} multi-GPU worker processes")
 
         for p in self.processes:
+            self._log_startup_step(f"Starting multi-GPU worker process pid target pending")
             p.start()
+        self._log_startup_step("Waiting for all multi-GPU workers to be ready")
 
         for event in self.prepare_events:
             event.wait()
